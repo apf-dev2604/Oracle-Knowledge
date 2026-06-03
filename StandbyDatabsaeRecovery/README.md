@@ -1,3 +1,41 @@
+# Standby RMAN Archive-Log Refresh Refactor
+
+This package splits the original single Python script into portable components:
+
+```text
+main.py                         # CLI entrypoint only
+config.ini                      # tunable parameters
+helpers/standbyengine.py         # refresh orchestration/business logic
+helpers/dbManager.py             # Oracle SQL*Plus and RMAN execution
+helpers/s3archivelog.py          # copy/extract/stage archive-log bundles
+helpers/mailer.py                # SMTP error notification
+helpers/messager.py              # webhook text notification
+queries/standbydb.sql            # SQL statements loaded by name at runtime
+```
+
+## Run
+
+```bash
+cd standby_refresh_refactor
+python3 main.py 2026_05_25 0 --config config.ini
+```
+
+## Notes
+
+- `helpers/dbManager.py` is the only class that executes SQL*Plus and RMAN.
+- `helpers/standbyengine.py` calls `DbManager`; it does not directly run subprocess Oracle commands.
+- `queries/standbydb.sql` is loaded only when `DbManager` is initialized, then each named query is called by the engine.
+- `helpers/s3archivelog.py` supports a mounted S3 path such as `/mnt/s3bucket/RMAN/`. If `s3_base` starts with `s3://`, it calls `aws s3 cp`, so the AWS CLI must be configured on the host.
+- `helpers/messager.py` works with Slack/Teams/Discord-style webhook endpoints. It uses `requests` if installed, otherwise falls back to Python standard-library `urllib`.
+
+## Recommended architecture
+
+This is a good production direction: keep orchestration, database execution, external file staging, notifications, SQL text, and configuration separated. For Oracle/RMAN automation, the main additional best practice is to keep `DbManager` as the single execution boundary so audit logging, error handling, timeouts, and security checks are centralized.
+
+
+
+
+
 Skip to content
 apf-dev2604
 Oracle-Knowledge
@@ -64,4 +102,7 @@ Comments
  (0)
 Comment
 You're not receiving notifications from this thread.
+
+
+
 
