@@ -1,0 +1,1612 @@
+#!/usr/bin/env python3
+
+import os
+import subprocess
+import shutil
+import logging
+import re
+import argparse
+import sys
+import fnmatch
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+
+class RmanArchiveLogOnlyRefresh:
+    def __init__(
+        self,
+        sid,
+        s3_base,
+        local_base,
+        db_home,
+        start_date,
+        days_input=3,
+        archive_pattern="*_archivelog_1*.tar.gz",
+        bridge_lookback_days=1,
+        open_read_only=True,
+        cleanup_local_after_success=True,
+        uncatalog_local_after_success=True,
+        cleanup_local_on_rejected_run=True,
+        uncatalog_local_on_rejected_run=True,
+        strict_old_logs_stop=False,
+        fail_if_no_forward=False
+    ):
+        self.sid = sid
+        self.db_home = db_home
+        self.s3_base = s3_base
+        self.local_base = local_base
+        self.archive_pattern = archive_pattern
+        self.bridge_lookback_days = int(bridge_lookback_days)
+
+        self.open_read_only_after_recovery = open_read_only
+        self.cleanup_local_after_success = cleanup_local_after_success
+        self.uncatalog_local_after_success = uncatalog_local_after_success
+        self.cleanup_local_on_rejected_run = cleanup_local_on_rejected_run
+        self.uncatalog_local_on_rejected_run = uncatalog_local_on_rejected_run
+        self.strict_old_logs_stop = strict_old_logs_stop
+        self.fail_if_no_forward = fail_if_no_forward
+
+        try:
+            self.start_date_obj = datetime.strptime(start_date, "%Y_%m_%d")
+        except ValueError:
+            print(f"ERROR: Date format must be YYYY_MM_DD. Received: {start_date}")
+            sys.exit(1)
+
+        self.days_to_scan = int(days_input)
+
+        self.sql_bin = os.path.join(self.db_home, "bin", "sqlplus")
+        self.rman_bin = os.path.join(self.db_home, "bin", "rman")
+        self.tar_bin = "/usr/bin/tar"
+
+        self.env = os.environ.copy()
+        self.env.update({
+            "ORACLE_SID": self.sid,
+            "ORACLE_HOME": self.db_home,
+            "LD_LIBRARY_PATH": f"{self.db_home}/lib:{self.db_home}/network/lib",
+            "PATH": f"{self.db_home}/bin:/usr/bin:/bin"
+        })
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            stream=sys.stdout
+        )
+
+        self.logger = logging.getLogger("RmanArchiveLogOnlyRefresh")
+
+        self.requested_days = []
+        self.bridge_days = []
+        self.processed_days = []
+        self.staged_days = set()
+
+        self.cataloged_files = []
+        self.cataloged_path_set = set()
+
+        self.current_run_candidate_files = []
+        self.source_archivelog_tar_files = []
+        self.local_archivelog_tar_files = []
+
+        self.archive_log_details = []
+        self.usable_forward_archive_logs = []
+        self.old_or_already_applied_archive_logs = []
+
+        self.before_recovery_scn = 0
+        self.target_recovery_scn = 0
+        self.after_recovery_scn = 0
+
+        self.current_branch = "UNKNOWN"
+        self.archivelog_branches = set()
+
+        self.recovery_applied = False
+        self.validation_status = "NOT_STARTED"
+        self.recovery_status = "NOT_STARTED"
+
+        self.cleanup_deleted_files = []
+        self.cleanup_skipped_files = []
+        self.uncataloged_files = []
+        self.uncatalog_failed_files = []
+
+        self.summary_file = None
+
+    # ------------------------------------------------------------------
+    # Generic command helpers
+    # ------------------------------------------------------------------
+
+    def _safe_exec(self, cmd, input_str=None):
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=self.env,
+                text=True
+            )
+
+            stdout, stderr = proc.communicate(input=input_str)
+
+            return stdout or "", stderr or "", proc.returncode
+
+        except Exception as exc:
+            return "", str(exc), 1
+
+    def _has_oracle_error(self, text):
+        return bool(
+            re.search(
+                r"\b(ORA|SP2|RMAN|LRM)-\d{4,5}\b",
+                text or "",
+                re.IGNORECASE
+            )
+        )
+
+    def _rman_has_fatal_error(self, text):
+        if not text:
+            return False
+
+        fatal_patterns = [
+            r"\bRMAN-00569\b",
+            r"\bRMAN-03002\b",
+            r"\bRMAN-03009\b",
+            r"\bRMAN-06025\b",
+            r"\bRMAN-06053\b",
+            r"\bRMAN-06054\b",
+            r"\bORA-\d{5}\b",
+        ]
+
+        return any(
+            re.search(pattern, text, re.IGNORECASE)
+            for pattern in fatal_patterns
+        )
+
+    def _clean_sql_output(self, output):
+        cleaned = []
+
+        noise_prefixes = (
+            "SQL>",
+            "Connected to:",
+            "Oracle Database",
+            "Copyright",
+            "Last Successful login",
+        )
+
+        for line in (output or "").splitlines():
+            s = line.strip()
+
+            if not s:
+                continue
+
+            if any(s.startswith(prefix) for prefix in noise_prefixes):
+                continue
+
+            cleaned.append(s)
+
+        return "\n".join(cleaned).strip()
+
+    def _run_sql(self, sql, raise_on_error=True):
+        sql_script = f"""
+SET SQLBLANKLINES ON
+SET FEEDBACK OFF
+SET HEADING OFF
+SET PAGESIZE 0
+SET LINESIZE 1000
+SET TRIMSPOOL ON
+SET TAB OFF
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+WHENEVER OSERROR EXIT FAILURE
+{sql}
+EXIT;
+"""
+
+        stdout, stderr, rc = self._safe_exec(
+            [self.sql_bin, "-L", "-S", "/", "as", "sysdba"],
+            sql_script
+        )
+
+        combined = f"{stdout}\n{stderr}".strip()
+
+        if raise_on_error and (rc != 0 or self._has_oracle_error(combined)):
+            raise RuntimeError(f"SQL failed. RC={rc}\n{combined}")
+
+        return self._clean_sql_output(stdout)
+
+    def _run_sql_no_raise(self, sql):
+        try:
+            return self._run_sql(sql, raise_on_error=False)
+        except Exception as exc:
+            self.logger.warning(f"SQL warning ignored: {exc}")
+            return ""
+
+    def _run_rman(self, rman_script, raise_on_error=True):
+        stdout, stderr, rc = self._safe_exec(
+            [self.rman_bin, "target", "/"],
+            rman_script
+        )
+
+        combined = f"{stdout}\n{stderr}".strip()
+
+        if raise_on_error and (rc != 0 or self._rman_has_fatal_error(combined)):
+            raise RuntimeError(f"RMAN failed. RC={rc}\n{combined}")
+
+        return combined, rc
+
+    def _rman_catalog_success(self, text):
+        lower = (text or "").lower()
+
+        success_phrases = [
+            "cataloged backup piece",
+            "cataloged archived log",
+            "cataloged archive log",
+            "already cataloged",
+        ]
+
+        return any(phrase in lower for phrase in success_phrases)
+
+    def _sql_literal_list(self, values):
+        if not values:
+            return None
+
+        escaped = []
+
+        for value in values:
+            escaped.append("'" + value.replace("'", "''") + "'")
+
+        return ",".join(escaped)
+
+    def _parse_int_or_zero(self, value):
+        try:
+            if not value:
+                return 0
+
+            lines = [
+                line.strip()
+                for line in value.splitlines()
+                if line.strip()
+                and not line.strip().upper().startswith("SP2-")
+                and not line.strip().upper().startswith("ORA-")
+            ]
+
+            if not lines:
+                return 0
+
+            return int(lines[-1])
+
+        except Exception:
+            return 0
+
+    def _split_pipe_rows(self, sql_output, expected_columns):
+        rows = []
+
+        for line in (sql_output or "").splitlines():
+            line = line.strip()
+
+            if not line:
+                continue
+
+            if "|" not in line:
+                continue
+
+            parts = line.split("|")
+
+            if len(parts) == expected_columns:
+                rows.append(parts)
+
+        return rows
+
+    def _is_under_directory(self, file_path, base_dir):
+        try:
+            real_file = os.path.realpath(file_path)
+            real_base = os.path.realpath(base_dir)
+            return os.path.commonpath([real_file, real_base]) == real_base
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # Database state
+    # ------------------------------------------------------------------
+
+    def get_open_mode(self):
+        result = self._run_sql_no_raise("SELECT open_mode FROM v$database;")
+
+        if not result:
+            return "IDLE_OR_UNKNOWN"
+
+        if "ORA-01034" in result or "not available" in result.lower():
+            return "IDLE_OR_UNKNOWN"
+
+        return result.strip()
+
+    def prepare_db_state(self):
+        self.logger.info("--- Phase 0: Database State Verification ---")
+
+        status = self.get_open_mode()
+        self.logger.info(f"Current DB status: {status}")
+
+        if status == "IDLE_OR_UNKNOWN":
+            self.logger.warning("Database appears down or idle. Attempting STARTUP MOUNT.")
+            self._run_sql("STARTUP MOUNT;", raise_on_error=False)
+            status = self.get_open_mode()
+
+        elif "MOUNTED" not in status:
+            self.logger.info(f"Database is currently {status}. Restarting to MOUNT.")
+            self._run_sql("SHUTDOWN ABORT;", raise_on_error=False)
+            self._run_sql("STARTUP MOUNT;", raise_on_error=False)
+            status = self.get_open_mode()
+
+        if "MOUNTED" not in status:
+            raise RuntimeError(
+                f"Database is not mounted after preparation. Current status: {status}"
+            )
+
+        self.logger.info("Database is verified in MOUNTED state.")
+
+    # ------------------------------------------------------------------
+    # Archive-log staging
+    # ------------------------------------------------------------------
+
+    def _safe_move_flattened_file(self, src, dst_dir):
+        base = os.path.basename(src)
+        dst = os.path.join(dst_dir, base)
+
+        if os.path.abspath(src) == os.path.abspath(dst):
+            return dst
+
+        if not os.path.exists(dst):
+            shutil.move(src, dst)
+            return dst
+
+        name, ext = os.path.splitext(base)
+        counter = 1
+
+        while True:
+            candidate = os.path.join(dst_dir, f"{name}_{counter}{ext}")
+
+            if not os.path.exists(candidate):
+                shutil.move(src, candidate)
+                return candidate
+
+            counter += 1
+
+    def _is_target_archivelog_tar(self, file_name):
+        lower_name = file_name.lower()
+        lower_pattern = self.archive_pattern.lower()
+        return fnmatch.fnmatch(lower_name, lower_pattern)
+
+    def stage_archivelog_date(self, date_str, role):
+        if date_str in self.staged_days:
+            self.logger.info(f"Date {date_str} is already staged. Role={role}.")
+            return True
+
+        local_dir = os.path.join(self.local_base, date_str)
+        source_date_dir = os.path.join(self.s3_base, date_str)
+
+        if not os.path.isdir(source_date_dir):
+            self.logger.warning(f"Source date directory not found: {source_date_dir}")
+            return False
+
+        os.makedirs(local_dir, exist_ok=True)
+
+        all_source_files = [
+            f for f in sorted(os.listdir(source_date_dir))
+            if os.path.isfile(os.path.join(source_date_dir, f))
+        ]
+
+        if not all_source_files:
+            self.logger.warning(f"No files found in source date directory: {source_date_dir}")
+            return False
+
+        source_files = [
+            f for f in all_source_files
+            if self._is_target_archivelog_tar(f)
+        ]
+
+        skipped_files = [
+            f for f in all_source_files
+            if f not in source_files
+        ]
+
+        for skipped in skipped_files:
+            self.logger.info(
+                f"Skipping file because it does not match {self.archive_pattern}: {skipped}"
+            )
+
+        if not source_files:
+            self.logger.warning(
+                f"No matching archive-log tar files found in {source_date_dir}. "
+                f"Pattern used: {self.archive_pattern}"
+            )
+            return False
+
+        try:
+            for file_name in source_files:
+                src = os.path.join(source_date_dir, file_name)
+                dst = os.path.join(local_dir, file_name)
+
+                self.logger.info(
+                    f"Staging {role} archive-log tar: {src} to {dst}"
+                )
+
+                shutil.copy2(src, dst)
+
+                self.source_archivelog_tar_files.append(src)
+                self.local_archivelog_tar_files.append(dst)
+
+                extract_dir = os.path.join(
+                    local_dir,
+                    f".extract_{date_str}_{file_name.replace('/', '_').replace('.tar.gz', '')}"
+                )
+
+                if os.path.exists(extract_dir):
+                    shutil.rmtree(extract_dir)
+
+                os.makedirs(extract_dir, exist_ok=True)
+
+                self.logger.info(f"Extracting {dst} into temporary folder {extract_dir}")
+
+                stdout, stderr, rc = self._safe_exec(
+                    [self.tar_bin, "-xzf", dst, "-C", extract_dir]
+                )
+
+                if rc != 0:
+                    raise RuntimeError(
+                        f"tar extraction failed for {dst}\n{stdout}\n{stderr}"
+                    )
+
+                for root, dirs, files in os.walk(extract_dir, topdown=False):
+                    for extracted_file in files:
+                        src_extracted = os.path.join(root, extracted_file)
+
+                        if not os.path.isfile(src_extracted):
+                            continue
+
+                        final_path = self._safe_move_flattened_file(
+                            src_extracted,
+                            local_dir
+                        )
+
+                        self.current_run_candidate_files.append(final_path)
+                        self.logger.info(
+                            f"Registered current-run candidate file: {final_path}"
+                        )
+
+                shutil.rmtree(extract_dir, ignore_errors=True)
+
+            for root, dirs, files in os.walk(local_dir):
+                for d in dirs:
+                    os.chmod(os.path.join(root, d), 0o775)
+
+                for f in files:
+                    os.chmod(os.path.join(root, f), 0o664)
+
+            self.staged_days.add(date_str)
+            self.processed_days.append(date_str)
+
+            if role == "REQUESTED":
+                self.requested_days.append(date_str)
+            elif role == "BRIDGE":
+                self.bridge_days.append(date_str)
+
+            return True
+
+        except Exception as exc:
+            self.logger.error(f"Stage/extract error for {date_str}: {exc}")
+            return False
+
+    def stage_requested_dates(self):
+        staged_any = False
+
+        for i in range(self.days_to_scan + 1):
+            date_str = (self.start_date_obj + timedelta(days=i)).strftime("%Y_%m_%d")
+
+            if self.stage_archivelog_date(date_str, "REQUESTED"):
+                staged_any = True
+
+        return staged_any
+
+    def stage_bridge_date_by_index(self, lookback_index):
+        bridge_date = self.start_date_obj - timedelta(days=lookback_index)
+        date_str = bridge_date.strftime("%Y_%m_%d")
+
+        return self.stage_archivelog_date(date_str, "BRIDGE")
+
+    def collect_candidate_files(self):
+        candidates = []
+
+        for full_path in self.current_run_candidate_files:
+            if not os.path.isfile(full_path):
+                self.logger.warning(f"Skipping missing current-run file: {full_path}")
+                continue
+
+            if full_path.endswith(".tar.gz"):
+                continue
+
+            if os.path.getsize(full_path) == 0:
+                self.logger.warning(f"Skipping zero-byte file: {full_path}")
+                continue
+
+            candidates.append(full_path)
+
+        self.logger.info(
+            f"Current-run candidate files selected for RMAN catalog: {len(candidates)}"
+        )
+
+        return candidates
+
+    # ------------------------------------------------------------------
+    # RMAN cataloging
+    # ------------------------------------------------------------------
+
+    def catalog_one_file(self, file_path):
+        escaped_path = file_path.replace("'", "''")
+
+        backup_piece_script = f"""
+CATALOG BACKUPPIECE '{escaped_path}';
+EXIT;
+"""
+
+        output, _ = self._run_rman(backup_piece_script, raise_on_error=False)
+
+        if self._rman_catalog_success(output):
+            self.logger.info(f"[CATALOGED BACKUPPIECE] {file_path}")
+            return True, "BACKUPPIECE"
+
+        archivelog_script = f"""
+CATALOG ARCHIVELOG '{escaped_path}';
+EXIT;
+"""
+
+        output2, _ = self._run_rman(archivelog_script, raise_on_error=False)
+
+        if self._rman_catalog_success(output2):
+            self.logger.info(f"[CATALOGED ARCHIVELOG] {file_path}")
+            return True, "ARCHIVELOG"
+
+        self.logger.warning(f"[NOT CATALOGED] {file_path}")
+        return False, "UNKNOWN"
+
+    def catalog_new_files(self):
+        self.logger.info("--- RMAN Catalog Registration ---")
+
+        candidates = self.collect_candidate_files()
+
+        if not candidates:
+            self.logger.error("No candidate archive-log files found after extraction.")
+            return False
+
+        catalog_count = 0
+
+        for file_path in candidates:
+            if file_path in self.cataloged_path_set:
+                continue
+
+            ok, file_type = self.catalog_one_file(file_path)
+
+            if ok:
+                self.cataloged_files.append((file_path, file_type))
+                self.cataloged_path_set.add(file_path)
+                catalog_count += 1
+
+        self.logger.info(f"Newly cataloged files: {catalog_count}")
+        self.logger.info(f"Total current-run cataloged files: {len(self.cataloged_files)}")
+
+        return len(self.cataloged_files) > 0
+
+    # ------------------------------------------------------------------
+    # Branch compatibility
+    # ------------------------------------------------------------------
+
+    def _parse_branch_rows(self, sql_output):
+        branches = set()
+
+        for line in (sql_output or "").splitlines():
+            line = line.strip()
+
+            if not line:
+                continue
+
+            if "|" not in line:
+                continue
+
+            branches.add(line)
+
+        return branches
+
+    def _format_branch_set(self, branches):
+        if not branches:
+            return "NONE"
+
+        return ", ".join(sorted(branches))
+
+    def get_current_resetlogs_branch(self):
+        result = self._run_sql("""
+SELECT TO_CHAR(resetlogs_change#) || '|' ||
+       TO_CHAR(resetlogs_time, 'YYYY-MM-DD HH24:MI:SS')
+FROM v$database;
+""")
+
+        return result.strip()
+
+    def get_cataloged_backup_redolog_branches(self):
+        backup_piece_paths = [
+            file_path
+            for file_path, file_type in self.cataloged_files
+            if file_type == "BACKUPPIECE"
+        ]
+
+        in_list = self._sql_literal_list(backup_piece_paths)
+
+        if not in_list:
+            return set()
+
+        result = self._run_sql_no_raise(f"""
+SELECT DISTINCT
+       TO_CHAR(r.resetlogs_change#) || '|' ||
+       TO_CHAR(r.resetlogs_time, 'YYYY-MM-DD HH24:MI:SS')
+FROM v$backup_redolog r,
+     v$backup_piece p
+WHERE r.set_stamp = p.set_stamp
+  AND r.set_count = p.set_count
+  AND p.handle IN ({in_list})
+  AND r.resetlogs_change# IS NOT NULL
+ORDER BY 1;
+""")
+
+        return self._parse_branch_rows(result)
+
+    def get_cataloged_raw_archivelog_branches(self):
+        archivelog_paths = [
+            file_path
+            for file_path, file_type in self.cataloged_files
+            if file_type == "ARCHIVELOG"
+        ]
+
+        in_list = self._sql_literal_list(archivelog_paths)
+
+        if not in_list:
+            return set()
+
+        result = self._run_sql_no_raise(f"""
+SELECT DISTINCT
+       TO_CHAR(resetlogs_change#) || '|' ||
+       TO_CHAR(resetlogs_time, 'YYYY-MM-DD HH24:MI:SS')
+FROM v$archived_log
+WHERE name IN ({in_list})
+  AND resetlogs_change# IS NOT NULL
+ORDER BY 1;
+""")
+
+        return self._parse_branch_rows(result)
+
+    def check_branch_compatibility(self):
+        self.logger.info("--- Branch Compatibility Check ---")
+
+        self.current_branch = self.get_current_resetlogs_branch()
+
+        backup_redolog_branches = self.get_cataloged_backup_redolog_branches()
+        raw_archivelog_branches = self.get_cataloged_raw_archivelog_branches()
+
+        self.archivelog_branches = backup_redolog_branches.union(raw_archivelog_branches)
+
+        self.logger.info(f"Current DB branch:       {self.current_branch}")
+        self.logger.info(
+            f"Archive-log branch:      {self._format_branch_set(self.archivelog_branches)}"
+        )
+
+        if not self.archivelog_branches:
+            self.validation_status = "FAILED_NO_ARCHIVELOG_BRANCH_METADATA"
+            self.logger.warning(
+                "No archive-log branch metadata found. Recovery cannot be safely validated."
+            )
+            return False
+
+        if self.current_branch not in self.archivelog_branches:
+            self.validation_status = "FAILED_BRANCH_MISMATCH"
+            self.logger.warning(
+                "Branch mismatch: cataloged archive logs do not match the mounted database branch."
+            )
+            self.logger.warning(f"Current DB branch:  {self.current_branch}")
+            self.logger.warning(
+                f"Archive-log branch: {self._format_branch_set(self.archivelog_branches)}"
+            )
+            self.logger.warning("Safety stop: recovery will not continue.")
+            return False
+
+        self.logger.info(
+            "Branch compatibility check passed. Cataloged archive logs match the mounted database branch."
+        )
+
+        return True
+
+    # ------------------------------------------------------------------
+    # SCN and archive-log validation
+    # ------------------------------------------------------------------
+
+    def get_current_datafile_scn(self):
+        result = self._run_sql("""
+SELECT NVL(MIN(checkpoint_change#), 0)
+FROM v$datafile;
+""")
+
+        return self._parse_int_or_zero(result)
+
+    def collect_archive_log_details(self, current_db_scn):
+        self.logger.info("--- Archive-Log Forward-Only Validation ---")
+
+        self.archive_log_details = []
+        self.usable_forward_archive_logs = []
+        self.old_or_already_applied_archive_logs = []
+
+        backup_piece_paths = [
+            file_path
+            for file_path, file_type in self.cataloged_files
+            if file_type == "BACKUPPIECE"
+        ]
+
+        raw_archivelog_paths = [
+            file_path
+            for file_path, file_type in self.cataloged_files
+            if file_type == "ARCHIVELOG"
+        ]
+
+        bp_list = self._sql_literal_list(backup_piece_paths)
+        al_list = self._sql_literal_list(raw_archivelog_paths)
+
+        if bp_list:
+            result = self._run_sql_no_raise(f"""
+SELECT p.handle || '|' ||
+       r.thread# || '|' ||
+       r.sequence# || '|' ||
+       r.first_change# || '|' ||
+       r.next_change# || '|' ||
+       TO_CHAR(r.first_time, 'YYYY-MM-DD HH24:MI:SS') || '|' ||
+       TO_CHAR(r.next_time, 'YYYY-MM-DD HH24:MI:SS')
+FROM v$backup_redolog r,
+     v$backup_piece p
+WHERE r.set_stamp = p.set_stamp
+  AND r.set_count = p.set_count
+  AND p.handle IN ({bp_list})
+  AND r.resetlogs_change# = (
+      SELECT resetlogs_change# FROM v$database
+  )
+ORDER BY r.thread#, r.sequence#;
+""")
+
+            for row in self._split_pipe_rows(result, 7):
+                path, thread_no, sequence_no, first_scn, next_scn, first_time, next_time = row
+
+                detail = {
+                    "source_type": "BACKUP_REDOLOG",
+                    "path": path,
+                    "thread": int(thread_no),
+                    "sequence": int(sequence_no),
+                    "first_scn": int(first_scn),
+                    "next_scn": int(next_scn),
+                    "first_time": first_time,
+                    "next_time": next_time,
+                    "status": "UNCLASSIFIED",
+                }
+
+                self.archive_log_details.append(detail)
+
+        if al_list:
+            result = self._run_sql_no_raise(f"""
+SELECT name || '|' ||
+       thread# || '|' ||
+       sequence# || '|' ||
+       first_change# || '|' ||
+       next_change# || '|' ||
+       TO_CHAR(first_time, 'YYYY-MM-DD HH24:MI:SS') || '|' ||
+       TO_CHAR(next_time, 'YYYY-MM-DD HH24:MI:SS')
+FROM v$archived_log
+WHERE name IN ({al_list})
+  AND resetlogs_change# = (
+      SELECT resetlogs_change# FROM v$database
+  )
+ORDER BY thread#, sequence#;
+""")
+
+            for row in self._split_pipe_rows(result, 7):
+                path, thread_no, sequence_no, first_scn, next_scn, first_time, next_time = row
+
+                detail = {
+                    "source_type": "ARCHIVED_LOG",
+                    "path": path,
+                    "thread": int(thread_no),
+                    "sequence": int(sequence_no),
+                    "first_scn": int(first_scn),
+                    "next_scn": int(next_scn),
+                    "first_time": first_time,
+                    "next_time": next_time,
+                    "status": "UNCLASSIFIED",
+                }
+
+                self.archive_log_details.append(detail)
+
+        for detail in self.archive_log_details:
+            if detail["next_scn"] > current_db_scn:
+                detail["status"] = "USABLE_FORWARD"
+                self.usable_forward_archive_logs.append(detail)
+            else:
+                detail["status"] = "OLD_OR_ALREADY_APPLIED"
+                self.old_or_already_applied_archive_logs.append(detail)
+
+        self.logger.info(f"Archive logs inspected: {len(self.archive_log_details)}")
+        self.logger.info(f"Usable forward archive logs: {len(self.usable_forward_archive_logs)}")
+        self.logger.info(
+            f"Old/already-applied archive logs: {len(self.old_or_already_applied_archive_logs)}"
+        )
+
+        for detail in self.old_or_already_applied_archive_logs:
+            self.logger.info(
+                "Old/already-applied archive log excluded from target SCN: "
+                f"THREAD={detail['thread']} "
+                f"SEQ={detail['sequence']} "
+                f"FIRST_SCN={detail['first_scn']} "
+                f"NEXT_SCN={detail['next_scn']} "
+                f"PATH={detail['path']}"
+            )
+
+        for detail in self.usable_forward_archive_logs:
+            self.logger.info(
+                "Forward archive log candidate: "
+                f"THREAD={detail['thread']} "
+                f"SEQ={detail['sequence']} "
+                f"FIRST_SCN={detail['first_scn']} "
+                f"NEXT_SCN={detail['next_scn']} "
+                f"PATH={detail['path']}"
+            )
+
+        return len(self.archive_log_details) > 0
+
+    def validate_forward_recovery_plan(self):
+        if not self.archive_log_details:
+            self.validation_status = "FAILED_NO_ARCHIVELOG_METADATA"
+            self.logger.error("No archive-log metadata was found for the current run.")
+            return False
+
+        if self.strict_old_logs_stop and self.old_or_already_applied_archive_logs:
+            self.validation_status = "FAILED_OLD_ARCHIVELOGS_PRESENT_STRICT_MODE"
+            self.logger.error(
+                "Strict mode enabled and old/already-applied archive logs are present. "
+                "Recovery will not continue."
+            )
+            return False
+
+        if not self.usable_forward_archive_logs:
+            self.validation_status = "NO_FORWARD_ARCHIVELOGS"
+            self.logger.info(
+                "No forward archive logs found. Local staging files will be cleaned. "
+                "Recovery is not required for this bundle."
+            )
+            return False
+
+        logs_by_thread = defaultdict(list)
+
+        for detail in self.usable_forward_archive_logs:
+            logs_by_thread[detail["thread"]].append(detail)
+
+        for thread_no, logs in logs_by_thread.items():
+            logs.sort(key=lambda item: item["sequence"])
+
+            first_log = logs[0]
+
+            if first_log["first_scn"] > self.before_recovery_scn:
+                self.validation_status = "FAILED_START_SCN_GAP"
+                self.logger.error(
+                    "Archive-log SCN gap detected before first forward log. "
+                    f"THREAD={thread_no} "
+                    f"FIRST_FORWARD_SEQ={first_log['sequence']} "
+                    f"FIRST_FORWARD_FIRST_SCN={first_log['first_scn']} "
+                    f"CURRENT_DB_SCN={self.before_recovery_scn}"
+                )
+                return False
+
+            previous_sequence = None
+
+            for detail in logs:
+                if previous_sequence is not None:
+                    expected_sequence = previous_sequence + 1
+
+                    if detail["sequence"] != expected_sequence:
+                        self.validation_status = "FAILED_SEQUENCE_GAP"
+                        self.logger.error(
+                            "Archive-log sequence gap detected in current run. "
+                            f"THREAD={thread_no} "
+                            f"EXPECTED_SEQ={expected_sequence} "
+                            f"FOUND_SEQ={detail['sequence']} "
+                            "Recovery will not continue."
+                        )
+                        return False
+
+                previous_sequence = detail["sequence"]
+
+        self.target_recovery_scn = max(
+            detail["next_scn"]
+            for detail in self.usable_forward_archive_logs
+        )
+
+        if self.target_recovery_scn <= self.before_recovery_scn:
+            self.validation_status = "FAILED_TARGET_NOT_FORWARD"
+            self.logger.error(
+                f"Target SCN {self.target_recovery_scn} is not greater than current SCN "
+                f"{self.before_recovery_scn}. Recovery will not continue."
+            )
+            return False
+
+        self.validation_status = "PASSED_FORWARD_ONLY"
+        self.logger.info(
+            f"Forward-only validation passed. Target SCN will be {self.target_recovery_scn}."
+        )
+
+        return True
+
+    def refresh_metadata_and_validate(self):
+        if not self.catalog_new_files():
+            self.validation_status = "FAILED_CATALOG"
+            return False
+
+        if not self.check_branch_compatibility():
+            return False
+
+        self.collect_archive_log_details(self.before_recovery_scn)
+        self.log_archive_coverage_from_details()
+
+        return self.validate_forward_recovery_plan()
+
+    # ------------------------------------------------------------------
+    # Archive gap and coverage logging
+    # ------------------------------------------------------------------
+
+    def log_archive_gap(self):
+        gap = self._run_sql_no_raise("""
+SELECT LOW_SEQUENCE# || '-' || HIGH_SEQUENCE#
+FROM v$archive_gap;
+""")
+
+        if gap and "-" in gap:
+            self.logger.warning(f"V$ARCHIVE_GAP reported: {gap}")
+        else:
+            self.logger.info("V$ARCHIVE_GAP: no gap reported by control file.")
+
+    def log_archive_coverage_from_details(self):
+        self.logger.info("--- Archive Coverage Summary For Current Run ---")
+
+        if not self.archive_log_details:
+            self.logger.warning("No archive-log details found for coverage summary.")
+            return
+
+        by_thread = defaultdict(list)
+
+        for detail in self.archive_log_details:
+            by_thread[detail["thread"]].append(detail)
+
+        for thread_no, logs in sorted(by_thread.items()):
+            logs.sort(key=lambda item: item["sequence"])
+
+            min_seq = min(item["sequence"] for item in logs)
+            max_seq = max(item["sequence"] for item in logs)
+            max_next_scn = max(item["next_scn"] for item in logs)
+
+            self.logger.info(
+                f"THREAD={thread_no} SEQ_RANGE={min_seq}-{max_seq} MAX_NEXT_SCN={max_next_scn}"
+            )
+
+    # ------------------------------------------------------------------
+    # Cleanup and uncatalog
+    # ------------------------------------------------------------------
+
+    def uncatalog_current_run_files(self, allow_without_recovery=False):
+        self.logger.info("--- RMAN Uncatalog: Current Local Staging Files ---")
+
+        if not self.recovery_applied and not allow_without_recovery:
+            self.logger.warning("Recovery was not applied. Uncatalog will not run.")
+            return
+
+        for file_path, file_type in self.cataloged_files:
+            if not self._is_under_directory(file_path, self.local_base):
+                self.logger.warning(f"Skipping uncatalog outside local_base: {file_path}")
+                self.uncatalog_failed_files.append(file_path)
+                continue
+
+            escaped_path = file_path.replace("'", "''")
+
+            if file_type == "BACKUPPIECE":
+                script = f"""
+CHANGE BACKUPPIECE '{escaped_path}' UNCATALOG;
+EXIT;
+"""
+            elif file_type == "ARCHIVELOG":
+                script = f"""
+CHANGE ARCHIVELOG LIKE '{escaped_path}' UNCATALOG;
+EXIT;
+"""
+            else:
+                self.logger.warning(f"Skipping uncatalog for unknown file type: {file_path}")
+                self.uncatalog_failed_files.append(file_path)
+                continue
+
+            output, rc = self._run_rman(script, raise_on_error=False)
+
+            if rc == 0 and not self._rman_has_fatal_error(output):
+                self.uncataloged_files.append(file_path)
+                self.logger.info(f"Uncataloged local staging file: {file_path}")
+            else:
+                self.uncatalog_failed_files.append(file_path)
+                self.logger.warning(f"Could not uncatalog {file_path}. RMAN output:\n{output}")
+
+    def cleanup_local_archivelog_files(self, allow_without_recovery=False):
+        self.logger.info("--- Cleanup: Local Archive-Log Staging Files ---")
+
+        if not self.recovery_applied and not allow_without_recovery:
+            self.logger.warning("Recovery was not applied. Cleanup will not run.")
+            return
+
+        files_to_delete = []
+
+        files_to_delete.extend(self.current_run_candidate_files)
+        files_to_delete.extend(self.local_archivelog_tar_files)
+
+        unique_files = sorted(set(files_to_delete))
+
+        if not unique_files:
+            self.logger.info("No local archive-log staging files registered for cleanup.")
+            return
+
+        for file_path in unique_files:
+            if not file_path:
+                continue
+
+            if not self._is_under_directory(file_path, self.local_base):
+                self.logger.warning(
+                    f"Skipping cleanup because file is outside local_base: {file_path}"
+                )
+                self.cleanup_skipped_files.append(file_path)
+                continue
+
+            if not os.path.isfile(file_path):
+                self.logger.info(f"Cleanup skip, file already missing: {file_path}")
+                self.cleanup_skipped_files.append(file_path)
+                continue
+
+            try:
+                os.remove(file_path)
+                self.cleanup_deleted_files.append(file_path)
+                self.logger.info(f"Deleted local staging file: {file_path}")
+
+            except Exception as exc:
+                self.cleanup_skipped_files.append(file_path)
+                self.logger.warning(f"Could not delete {file_path}: {exc}")
+
+        for date_str in self.processed_days:
+            date_dir = os.path.join(self.local_base, date_str)
+
+            if not self._is_under_directory(date_dir, self.local_base):
+                continue
+
+            try:
+                if os.path.isdir(date_dir) and not os.listdir(date_dir):
+                    os.rmdir(date_dir)
+                    self.logger.info(f"Removed empty local date directory: {date_dir}")
+            except Exception as exc:
+                self.logger.warning(f"Could not remove local date directory {date_dir}: {exc}")
+
+        self.logger.info(
+            f"Cleanup completed. Deleted={len(self.cleanup_deleted_files)}, "
+            f"Skipped/Failed={len(self.cleanup_skipped_files)}"
+        )
+
+    def cleanup_rejected_or_no_forward_run(self, reason):
+        self.logger.warning(
+            f"Recovery did not proceed. Reason={reason}. "
+            "Cleaning local staging files to preserve space."
+        )
+
+        if self.uncatalog_local_on_rejected_run:
+            self.uncatalog_current_run_files(allow_without_recovery=True)
+
+        if self.cleanup_local_on_rejected_run:
+            self.cleanup_local_archivelog_files(allow_without_recovery=True)
+
+    # ------------------------------------------------------------------
+    # Recovery
+    # ------------------------------------------------------------------
+
+    def perform_catalog_and_recovery(self):
+        if not self.catalog_new_files():
+            self.recovery_status = "FAILED_CATALOG"
+            self.logger.error("Cataloging did not register any usable archive-log files.")
+            self.write_recovery_summary(self.recovery_status)
+            return False
+
+        if not self.check_branch_compatibility():
+            self.recovery_status = self.validation_status
+            self.cleanup_rejected_or_no_forward_run(self.recovery_status)
+            self.write_recovery_summary(self.recovery_status)
+            return False
+
+        self.log_archive_gap()
+
+        self.before_recovery_scn = self.get_current_datafile_scn()
+        self.after_recovery_scn = self.before_recovery_scn
+
+        self.logger.info(f"CURRENT DATAFILE SCN BEFORE RECOVERY: {self.before_recovery_scn}")
+
+        self.collect_archive_log_details(self.before_recovery_scn)
+        self.log_archive_coverage_from_details()
+
+        valid = self.validate_forward_recovery_plan()
+
+        if not valid and self.validation_status == "FAILED_START_SCN_GAP":
+            self.logger.warning(
+                "Start-SCN gap detected. Bridge lookback will attempt to stage previous archive bundles."
+            )
+
+            for lookback_index in range(1, self.bridge_lookback_days + 1):
+                bridge_date = (
+                    self.start_date_obj - timedelta(days=lookback_index)
+                ).strftime("%Y_%m_%d")
+
+                self.logger.warning(
+                    f"Attempting bridge gap-sealer date: {bridge_date} "
+                    f"(lookback {lookback_index}/{self.bridge_lookback_days})"
+                )
+
+                staged = self.stage_bridge_date_by_index(lookback_index)
+
+                if not staged:
+                    self.logger.warning(f"Could not stage bridge date: {bridge_date}")
+                    continue
+
+                valid = self.refresh_metadata_and_validate()
+
+                if valid:
+                    self.logger.info(
+                        f"Bridge gap sealed by including previous archive date: {bridge_date}"
+                    )
+                    break
+
+                if self.validation_status != "FAILED_START_SCN_GAP":
+                    break
+
+        if not valid:
+            self.recovery_status = self.validation_status
+            self.cleanup_rejected_or_no_forward_run(self.recovery_status)
+            self.write_recovery_summary(self.recovery_status)
+
+            if self.recovery_status == "NO_FORWARD_ARCHIVELOGS" and not self.fail_if_no_forward:
+                return True
+
+            return False
+
+        self.logger.info(f"AVAILABLE FORWARD TARGET SCN FROM CURRENT RUN: {self.target_recovery_scn}")
+        self.logger.info("--- Phase 2: RMAN Archive-Log Recovery Execution ---")
+
+        recovery_script = f"""
+RUN {{
+    SET UNTIL SCN {self.target_recovery_scn};
+    RECOVER DATABASE;
+}}
+EXIT;
+"""
+
+        self._run_rman(recovery_script, raise_on_error=True)
+
+        self.recovery_applied = True
+        self.after_recovery_scn = self.get_current_datafile_scn()
+
+        self.logger.info(f"DATAFILE SCN AFTER RECOVERY: {self.after_recovery_scn}")
+
+        if self.after_recovery_scn <= self.before_recovery_scn:
+            self.recovery_status = "FAILED_NO_SCN_ADVANCE_AFTER_RECOVERY"
+            self.logger.error(
+                "RMAN recovery completed, but datafile SCN did not move forward. "
+                "This is treated as unsafe."
+            )
+            self.write_recovery_summary(self.recovery_status)
+            return False
+
+        self.recovery_status = "RECOVERY_APPLIED_SUCCESSFULLY"
+        self.logger.info("RMAN archive-log recovery completed successfully.")
+
+        if self.uncatalog_local_after_success:
+            self.uncatalog_current_run_files(allow_without_recovery=False)
+
+        if self.cleanup_local_after_success:
+            self.cleanup_local_archivelog_files(allow_without_recovery=False)
+
+        if self.open_read_only_after_recovery:
+            self.open_read_only()
+
+        self.write_recovery_summary(self.recovery_status)
+
+        return True
+
+    def open_read_only(self):
+        self.logger.info("Opening database READ ONLY only.")
+
+        status = self.get_open_mode()
+
+        if "READ ONLY" in status:
+            self.logger.info("Database is already open READ ONLY.")
+            return
+
+        if "MOUNTED" not in status:
+            self.logger.warning(
+                f"Database status before read-only open is {status}. "
+                "Attempting to restart to MOUNT first."
+            )
+            self._run_sql("SHUTDOWN ABORT;", raise_on_error=False)
+            self._run_sql("STARTUP MOUNT;", raise_on_error=False)
+
+        self._run_sql("ALTER DATABASE OPEN READ ONLY;")
+
+        final_status = self.get_open_mode()
+        self.logger.info(f"Database open mode after read-only open: {final_status}")
+
+    # ------------------------------------------------------------------
+    # Summary report
+    # ------------------------------------------------------------------
+
+    def write_recovery_summary(self, recovery_status):
+        summary_dir = os.path.join(self.local_base, "_refresh_summaries")
+        os.makedirs(summary_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        start_date_str = self.start_date_obj.strftime("%Y_%m_%d")
+
+        self.summary_file = os.path.join(
+            summary_dir,
+            f"rman_refresh_summary_{self.sid}_{start_date_str}_{timestamp}.log"
+        )
+
+        lines = []
+
+        lines.append("RMAN DAILY ARCHIVE-LOG REFRESH SUMMARY")
+        lines.append("=" * 80)
+        lines.append(f"SID: {self.sid}")
+        lines.append(f"Start date argument: {start_date_str}")
+        lines.append(f"Days scanned inclusive: {self.days_to_scan}")
+        lines.append(f"Bridge lookback days: {self.bridge_lookback_days}")
+        lines.append(f"Archive tar pattern: {self.archive_pattern}")
+        lines.append(f"Source base: {self.s3_base}")
+        lines.append(f"Local base: {self.local_base}")
+        lines.append(f"Oracle home: {self.db_home}")
+        lines.append(f"Requested days staged: {', '.join(self.requested_days) if self.requested_days else 'NONE'}")
+        lines.append(f"Bridge days staged: {', '.join(self.bridge_days) if self.bridge_days else 'NONE'}")
+        lines.append(f"Current DB branch: {self.current_branch}")
+        lines.append(f"Archive-log branches: {self._format_branch_set(self.archivelog_branches)}")
+        lines.append(f"Validation status: {self.validation_status}")
+        lines.append(f"Recovery status: {recovery_status}")
+        lines.append(f"Strict old logs stop: {self.strict_old_logs_stop}")
+        lines.append(f"Cleanup local after success: {self.cleanup_local_after_success}")
+        lines.append(f"Uncatalog local after success: {self.uncatalog_local_after_success}")
+        lines.append(f"Cleanup local on rejected/no-forward run: {self.cleanup_local_on_rejected_run}")
+        lines.append(f"Uncatalog local on rejected/no-forward run: {self.uncatalog_local_on_rejected_run}")
+        lines.append("")
+
+        lines.append("SCN SUMMARY")
+        lines.append("-" * 80)
+        lines.append(f"Before recovery datafile SCN: {self.before_recovery_scn}")
+        lines.append(f"Target recovery SCN:          {self.target_recovery_scn}")
+        lines.append(f"After recovery datafile SCN:  {self.after_recovery_scn}")
+        lines.append(f"Recovery applied:             {self.recovery_applied}")
+        lines.append("")
+
+        lines.append("SOURCE ARCHIVE TAR FILES")
+        lines.append("-" * 80)
+
+        if self.source_archivelog_tar_files:
+            for path in self.source_archivelog_tar_files:
+                lines.append(path)
+        else:
+            lines.append("NONE")
+
+        lines.append("")
+        lines.append("LOCAL ARCHIVE TAR FILES")
+        lines.append("-" * 80)
+
+        if self.local_archivelog_tar_files:
+            for path in self.local_archivelog_tar_files:
+                lines.append(path)
+        else:
+            lines.append("NONE")
+
+        lines.append("")
+        lines.append("CATALOGED CURRENT-RUN FILES")
+        lines.append("-" * 80)
+
+        if self.cataloged_files:
+            for path, file_type in self.cataloged_files:
+                lines.append(f"{file_type}|{path}")
+        else:
+            lines.append("NONE")
+
+        lines.append("")
+        lines.append("FORWARD ARCHIVE LOGS USED TO CHOOSE TARGET SCN")
+        lines.append("-" * 80)
+
+        if self.usable_forward_archive_logs:
+            for detail in self.usable_forward_archive_logs:
+                lines.append(
+                    f"{detail['status']}|"
+                    f"{detail['source_type']}|"
+                    f"THREAD={detail['thread']}|"
+                    f"SEQ={detail['sequence']}|"
+                    f"FIRST_SCN={detail['first_scn']}|"
+                    f"NEXT_SCN={detail['next_scn']}|"
+                    f"FIRST_TIME={detail['first_time']}|"
+                    f"NEXT_TIME={detail['next_time']}|"
+                    f"PATH={detail['path']}"
+                )
+        else:
+            lines.append("NONE")
+
+        lines.append("")
+        lines.append("OLD OR ALREADY APPLIED ARCHIVE LOGS EXCLUDED FROM TARGET SCN")
+        lines.append("-" * 80)
+
+        if self.old_or_already_applied_archive_logs:
+            for detail in self.old_or_already_applied_archive_logs:
+                lines.append(
+                    f"{detail['status']}|"
+                    f"{detail['source_type']}|"
+                    f"THREAD={detail['thread']}|"
+                    f"SEQ={detail['sequence']}|"
+                    f"FIRST_SCN={detail['first_scn']}|"
+                    f"NEXT_SCN={detail['next_scn']}|"
+                    f"FIRST_TIME={detail['first_time']}|"
+                    f"NEXT_TIME={detail['next_time']}|"
+                    f"PATH={detail['path']}"
+                )
+        else:
+            lines.append("NONE")
+
+        lines.append("")
+        lines.append("UNCATALOGED LOCAL STAGING FILES")
+        lines.append("-" * 80)
+
+        if self.uncataloged_files:
+            for path in self.uncataloged_files:
+                lines.append(path)
+        else:
+            lines.append("NONE")
+
+        lines.append("")
+        lines.append("UNCATALOG FAILED OR SKIPPED FILES")
+        lines.append("-" * 80)
+
+        if self.uncatalog_failed_files:
+            for path in self.uncatalog_failed_files:
+                lines.append(path)
+        else:
+            lines.append("NONE")
+
+        lines.append("")
+        lines.append("CLEANUP DELETED LOCAL FILES")
+        lines.append("-" * 80)
+
+        if self.cleanup_deleted_files:
+            for path in self.cleanup_deleted_files:
+                lines.append(path)
+        else:
+            lines.append("NONE")
+
+        lines.append("")
+        lines.append("CLEANUP SKIPPED OR FAILED LOCAL FILES")
+        lines.append("-" * 80)
+
+        if self.cleanup_skipped_files:
+            for path in self.cleanup_skipped_files:
+                lines.append(path)
+        else:
+            lines.append("NONE")
+
+        with open(self.summary_file, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+            fh.write("\n")
+
+        self.logger.info(f"Recovery summary written to: {self.summary_file}")
+
+    # ------------------------------------------------------------------
+    # Application verification - two business table checks
+    # ------------------------------------------------------------------
+
+    def verify_data(self):
+        self.logger.info("--- Phase 3: Data Verification ---")
+
+        status = self.get_open_mode()
+
+        if "MOUNTED" in status and self.open_read_only_after_recovery:
+            self.open_read_only()
+
+        verify_sql = """
+SELECT 'INPLAY.CASH_POSITION|' ||
+       TO_CHAR(MAX(BIZ_DATE), 'YYYY-MM-DD HH24:MI:SS')
+FROM INPLAY.CASH_POSITION;
+
+SELECT 'INPLAY.CASH_TRANSFER_HISTORY|' ||
+       TO_CHAR(MAX(TRANSFERDATE), 'YYYY-MM-DD HH24:MI:SS')
+FROM INPLAY.CASH_TRANSFER_HISTORY;
+"""
+
+        results = self._run_sql_no_raise(verify_sql)
+
+        if not results:
+            self.logger.warning("Business verification query returned no output or failed.")
+            return
+
+        for line in results.splitlines():
+            if "|" in line:
+                tbl, ts = line.split("|", 1)
+                self.logger.info(f"{tbl.ljust(35)} Latest: {ts}")
+
+    # ------------------------------------------------------------------
+    # Main driver
+    # ------------------------------------------------------------------
+
+    def run(self):
+        self.prepare_db_state()
+
+        if not self.stage_requested_dates():
+            self.recovery_status = "FAILED_NO_REQUESTED_DATE_STAGED"
+            self.logger.error("No requested archive-log date folders were successfully staged.")
+            self.write_recovery_summary(self.recovery_status)
+            return False
+
+        ok = self.perform_catalog_and_recovery()
+
+        if ok:
+            self.verify_data()
+
+        final_mode = self.get_open_mode()
+        self.logger.info(f"Final DB Status: {final_mode}")
+
+        return ok
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Oracle RMAN archive-log-only daily refresh script with bridge gap-sealer lookback. "
+            "Default pattern copies only *_archivelog_1*.tar.gz files."
+        )
+    )
+
+    parser.add_argument(
+        "date",
+        help="Start date in YYYY_MM_DD format, for example 2026_05_25"
+    )
+
+    parser.add_argument(
+        "days",
+        type=int,
+        nargs="?",
+        default=0,
+        help=(
+            "Number of forward days to scan. "
+            "This scans the start date plus this many days inclusively. Default: 0."
+        )
+    )
+
+    parser.add_argument(
+        "--sid",
+        default="stdbyinp",
+        help="Oracle SID. Default: stdbyinp"
+    )
+
+    parser.add_argument(
+        "--s3-base",
+        default="/mnt/s3bucket/RMAN/",
+        help="Source backup base path. Default: /mnt/s3bucket/RMAN/"
+    )
+
+    parser.add_argument(
+        "--local-base",
+        default="/u03/backup/rman/stdbyinp/",
+        help="Local staging base path. Default: /u03/backup/rman/stdbyinp/"
+    )
+
+    parser.add_argument(
+        "--db-home",
+        default="/opt/oracle/product/19c/dbhome_1",
+        help="Oracle Home path. Default: /opt/oracle/product/19c/dbhome_1"
+    )
+
+    parser.add_argument(
+        "--archive-pattern",
+        default="*_archivelog_1*.tar.gz",
+        help="Archive tar filename pattern to copy. Default: *_archivelog_1*.tar.gz"
+    )
+
+    parser.add_argument(
+        "--bridge-lookback-days",
+        type=int,
+        default=1,
+        help=(
+            "Number of previous days to temporarily stage when an SCN gap is detected. "
+            "Default: 1."
+        )
+    )
+
+    parser.add_argument(
+        "--no-open-read-only",
+        action="store_true",
+        help="Do not open the database read only after successful recovery."
+    )
+
+    parser.add_argument(
+        "--keep-local-after-success",
+        action="store_true",
+        help="Keep local copied/extracted archive-log staging files after successful recovery."
+    )
+
+    parser.add_argument(
+        "--keep-rman-catalog-after-success",
+        action="store_true",
+        help="Keep RMAN metadata for current-run local staging files after successful recovery."
+    )
+
+    parser.add_argument(
+        "--keep-local-on-rejected-run",
+        action="store_true",
+        help="Keep local copied/extracted archive-log staging files when run is rejected or no-forward."
+    )
+
+    parser.add_argument(
+        "--keep-rman-catalog-on-rejected-run",
+        action="store_true",
+        help="Keep RMAN metadata for current-run local staging files when run is rejected or no-forward."
+    )
+
+    parser.add_argument(
+        "--strict-old-logs-stop",
+        action="store_true",
+        help=(
+            "Stop if any old/already-applied archive log is present. "
+            "Not recommended for normal daily bundles because bundles can contain mixed old and forward logs."
+        )
+    )
+
+    parser.add_argument(
+        "--fail-if-no-forward",
+        action="store_true",
+        help="Exit with failure if no forward archive logs are found."
+    )
+
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    refresh = RmanArchiveLogOnlyRefresh(
+        sid=args.sid,
+        s3_base=args.s3_base,
+        local_base=args.local_base,
+        db_home=args.db_home,
+        start_date=args.date,
+        days_input=args.days,
+        archive_pattern=args.archive_pattern,
+        bridge_lookback_days=args.bridge_lookback_days,
+        open_read_only=not args.no_open_read_only,
+        cleanup_local_after_success=not args.keep_local_after_success,
+        uncatalog_local_after_success=not args.keep_rman_catalog_after_success,
+        cleanup_local_on_rejected_run=not args.keep_local_on_rejected_run,
+        uncatalog_local_on_rejected_run=not args.keep_rman_catalog_on_rejected_run,
+        strict_old_logs_stop=args.strict_old_logs_stop,
+        fail_if_no_forward=args.fail_if_no_forward
+    )
+
+    try:
+        ok = refresh.run()
+        sys.exit(0 if ok else 1)
+
+    except Exception as exc:
+        logging.getLogger("RmanArchiveLogOnlyRefresh").error(f"Fatal error: {exc}")
+
+        try:
+            refresh.recovery_status = f"FATAL_ERROR: {exc}"
+            refresh.write_recovery_summary(refresh.recovery_status)
+        except Exception:
+            pass
+
+        sys.exit(1)
