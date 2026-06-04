@@ -1,4 +1,5 @@
 config.ini
+queries/
 .env
 *.log
 *_summary_*.log
