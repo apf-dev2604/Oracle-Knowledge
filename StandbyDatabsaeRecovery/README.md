@@ -25,7 +25,7 @@ python3 main.py 2026_05_25 0 --config config.ini
 - `helpers/dbManager.py` is the only class that executes SQL*Plus and RMAN.
 - `helpers/standbyengine.py` calls `DbManager`; it does not directly run subprocess Oracle commands.
 - `queries/standbydb.sql` is loaded only when `DbManager` is initialized, then each named query is called by the engine.
-- `helpers/s3archivelog.py` supports a mounted S3 path such as `/mnt/s3bucket/RMAN/`. If `s3_base` starts with `s3://`, it calls `aws s3 cp`, so the AWS CLI must be configured on the host.
+- `helpers/s3archivelog.py` supports a mounted S3 path such as `/mnt/some-s3bucket-to-localmuount/RMAN/`. If `s3_base` starts with `s3://`, it calls `aws s3 cp`, so the AWS CLI must be configured on the host.
 - `helpers/messager.py` works with Slack/Teams/Discord-style webhook endpoints. It uses `requests` if installed, otherwise falls back to Python standard-library `urllib`.
 
 ## Recommended architecture
