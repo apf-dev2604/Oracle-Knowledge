@@ -1,5 +1,5 @@
 config.ini
-queries/*
+queries/standbydb.sql
 .env
 *.log
 *_summary_*.log
