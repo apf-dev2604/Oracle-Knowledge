@@ -16,7 +16,7 @@ queries/standbydb.sql            # SQL statements loaded by name at runtime
 ## Run
 
 ```bash
-cd standby_refresh_refactor
+cd Oracle-Knowledge/StandbyDatabsaeRecovery
 python3 main.py 2026_05_25 0 --config config.ini
 ```
 
